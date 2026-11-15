@@ -293,7 +293,41 @@ function days(){ return Math.max(1, Math.ceil(N / st.perDay)); }
 function pageWords(pi){ return DATA.slice(pi*st.perDay, Math.min(N,(pi+1)*st.perDay)); }
 function save(){ try{ localStorage.setItem(LS_KEY, JSON.stringify({status:st.status, curPage:curPage, perDay:st.perDay, bad:st.bad||{}, wrong:st.wrong||{}, testCountPref:st.testCountPref, reinforce:st.reinforce||{}, testMem:st.testMem||{}, testRun:st.testRun||null, spMem:st.spMem||{}})); }catch(e){} }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-/* ===== 朗读引擎：优先锁定英文语音，避免中文语音读英文导致发音变形 ===== */
+/* ===== 朗读引擎：有道真人音频优先，英文语音 TTS 兜底 ===== */
+/* ---- 第一层音源：有道词典真人发音（在线） ---- */
+var YD_AUDIO_BASE='https://dict.youdao.com/dictvoice?type=2&audio=';
+var AUDIO_START_TIMEOUT=3000;   /* 3 秒内未开始播放即判定失败 */
+var ydAudio=null;               /* 复用同一个 Audio 实例，避免叠音与实例泄漏 */
+var ydSeq=0;                    /* 发音令牌：新一轮发音会让上一轮所有回调作废 */
+var ydFailStreak=0;
+var ydFailUntil=0;
+
+function getYdAudio(){
+  if(ydAudio) return ydAudio;
+  try{
+    var a=new Audio();
+    a.preload='auto';
+    /* 不设置 crossOrigin：有道接口未开放 CORS，设置后反而会导致音频加载失败 */
+    ydAudio=a;
+  }catch(e){ ydAudio=null; }
+  return ydAudio;
+}
+function stopYdAudio(){
+  var a=ydAudio;
+  if(!a) return;
+  try{ a.onplaying=null; a.ontimeupdate=null; a.onended=null; a.onerror=null; }catch(e){}
+  try{ a.pause(); }catch(e){}
+  try{ a.currentTime=0; }catch(e){}
+}
+function ydMarkFail(){
+  ydFailStreak++;
+  /* 失败后进入冷却：单次失败冷却 20 秒，连续失败升级为 5 分钟，
+     避免网络不通时每次点读都先空等 3 秒超时才出声 */
+  var wait=(ydFailStreak>=2)?300000:20000;
+  ydFailUntil=Date.now()+wait;
+}
+
+/* ---- 第二层音源：系统英文语音 TTS（离线可用，仅作兜底） ---- */
 var EN_VOICE=null;
 var EN_VOICE_PREF=['Samantha','Alex','Google US English','Microsoft Aria','Microsoft Zira','Ava','Allison','Susan','Tom','Aaron','Nicky','Google UK English Female','Google UK English Male','Karen','Daniel','Moira','Tessa','Serena'];
 function pickEnVoice(){
@@ -353,7 +387,7 @@ if(document.readyState==='loading'){
 } else {
   initVoices();
 }
-function speak(w, cb){
+function speakTTS(w, cb){
   try{
     if(!window.speechSynthesis || !window.SpeechSynthesisUtterance){ if(cb) setTimeout(cb,0); return; }
     var u=new SpeechSynthesisUtterance(String(w));
@@ -374,6 +408,74 @@ function speak(w, cb){
     setTimeout(function(){ try{ speechSynthesis.speak(u); }catch(e){ fin(); } }, 30);
   }catch(e){ if(cb) setTimeout(cb,0); }
 }
+
+/* ---- 统一入口：调用签名保持 speak(word, onDone)，调用点无需改动 ---- */
+function speak(w, cb){
+  var word=String(w==null?'':w).trim();
+  var seq=++ydSeq;        /* 令牌自增：上一轮发音的所有回调立即失效 */
+  var settled=false;
+  var timer=null;
+
+  function alive(){ return seq===ydSeq; }
+  function clearTimer(){ if(timer){ clearTimeout(timer); timer=null; } }
+  function onStart(){
+    if(!alive()) return;
+    clearTimer();
+    ydFailStreak=0; ydFailUntil=0;   /* 真人音频可用则解除冷却 */
+  }
+  function finish(){
+    if(settled || !alive()) return;
+    settled=true; clearTimer();
+    if(cb) setTimeout(cb,150);
+  }
+  function toTTS(){
+    if(settled || !alive()) return;
+    if(!word){ settled=true; clearTimer(); if(cb) setTimeout(cb,0); return; }
+    settled=true; clearTimer();
+    stopYdAudio();                   /* 先掐掉可能迟到的音频，避免与 TTS 叠音 */
+    speakTTS(word, cb);
+  }
+
+  /* 发音前统一停止上一次：音频 pause + 归零，同时取消进行中的 TTS */
+  stopYdAudio();
+  try{ if(window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
+
+  if(!word){ if(cb) setTimeout(cb,0); return; }
+  /* 断网、冷却期内、浏览器不支持 Audio：直接走 TTS */
+  if(typeof navigator!=='undefined' && navigator.onLine===false){ toTTS(); return; }
+  if(Date.now()<ydFailUntil){ toTTS(); return; }
+  var a=getYdAudio();
+  if(!a || !a.play){ toTTS(); return; }
+
+  a.onplaying=onStart;
+  a.ontimeupdate=onStart;
+  a.onended=function(){
+    if(!alive() || settled) return;
+    ydFailStreak=0; ydFailUntil=0;
+    finish();
+  };
+  a.onerror=function(){
+    if(!alive() || settled) return;
+    ydMarkFail(); toTTS();
+  };
+  timer=setTimeout(function(){
+    if(!alive() || settled) return;
+    ydMarkFail(); toTTS();
+  }, AUDIO_START_TIMEOUT);
+
+  try{
+    a.src=YD_AUDIO_BASE+encodeURIComponent(word);
+  }catch(e){ ydMarkFail(); toTTS(); return; }
+
+  var p=null;
+  try{ p=a.play(); }catch(e){ ydMarkFail(); toTTS(); return; }
+  if(p && typeof p.then==='function'){
+    /* play() 成功只代表允许播放，不代表已出声；开始播放只认 playing/timeupdate，
+       否则超时保护会失效（网络卡住时既不达 playing 也不报 error） */
+    p.then(function(){}, function(){ if(!alive() || settled) return; ydMarkFail(); toTTS(); });
+  }
+}
+
 function playErrorBeep(){
   try{
     var C=window.AudioContext||window.webkitAudioContext; if(!C) return;
