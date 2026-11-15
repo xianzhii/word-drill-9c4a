@@ -293,14 +293,85 @@ function days(){ return Math.max(1, Math.ceil(N / st.perDay)); }
 function pageWords(pi){ return DATA.slice(pi*st.perDay, Math.min(N,(pi+1)*st.perDay)); }
 function save(){ try{ localStorage.setItem(LS_KEY, JSON.stringify({status:st.status, curPage:curPage, perDay:st.perDay, bad:st.bad||{}, wrong:st.wrong||{}, testCountPref:st.testCountPref, reinforce:st.reinforce||{}, testMem:st.testMem||{}, testRun:st.testRun||null, spMem:st.spMem||{}})); }catch(e){} }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+/* ===== 朗读引擎：优先锁定英文语音，避免中文语音读英文导致发音变形 ===== */
+var EN_VOICE=null;
+var EN_VOICE_PREF=['Samantha','Alex','Google US English','Microsoft Aria','Microsoft Zira','Ava','Allison','Susan','Tom','Aaron','Nicky','Google UK English Female','Google UK English Male','Karen','Daniel','Moira','Tessa','Serena'];
+function pickEnVoice(){
+  try{
+    if(!window.speechSynthesis || !speechSynthesis.getVoices) return null;
+    var vs=speechSynthesis.getVoices();
+    if(!vs || !vs.length) return null;
+    function low(s){ return String(s||'').toLowerCase(); }
+    function byName(list){
+      for(var i=0;i<EN_VOICE_PREF.length;i++){
+        var key=low(EN_VOICE_PREF[i]);
+        for(var j=0;j<list.length;j++){ if(low(list[j].name).indexOf(key)>-1) return list[j]; }
+      }
+      return null;
+    }
+    function pickGroup(group){
+      if(!group || !group.length) return null;
+      var local=[];
+      for(var i=0;i<group.length;i++){ if(group[i].localService!==false) local.push(group[i]); }
+      return byName(local) || byName(group) || local[0] || group[0] || null;
+    }
+    var us=[], gb=[], en=[];
+    for(var k=0;k<vs.length;k++){
+      var L=low(vs[k].lang).replace('_','-');
+      if(L.indexOf('en-us')===0) us.push(vs[k]);
+      else if(L.indexOf('en-gb')===0) gb.push(vs[k]);
+      else if(L.indexOf('en')===0) en.push(vs[k]);
+    }
+    return pickGroup(us) || pickGroup(gb) || pickGroup(en) || null;
+  }catch(e){ return null; }
+}
+function refreshEnVoice(){
+  var v=pickEnVoice();
+  if(v) EN_VOICE=v;
+  return EN_VOICE;
+}
+function initVoices(){
+  try{
+    if(!window.speechSynthesis) return;
+    refreshEnVoice();
+    if(typeof speechSynthesis.addEventListener==='function'){
+      speechSynthesis.addEventListener('voiceschanged', refreshEnVoice);
+    } else {
+      speechSynthesis.onvoiceschanged=refreshEnVoice;
+    }
+    /* iOS/macOS 首次调用常拿不到语音列表，短轮询兜底（最多约 3 秒） */
+    var tries=0;
+    var timer=setInterval(function(){
+      tries++;
+      refreshEnVoice();
+      if(EN_VOICE || tries>=10) clearInterval(timer);
+    }, 300);
+  }catch(e){}
+}
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded', initVoices);
+} else {
+  initVoices();
+}
 function speak(w, cb){
   try{
-    var u=new SpeechSynthesisUtterance(w); u.lang='en-US'; u.rate=0.85;
+    if(!window.speechSynthesis || !window.SpeechSynthesisUtterance){ if(cb) setTimeout(cb,0); return; }
+    var u=new SpeechSynthesisUtterance(String(w));
+    u.lang='en-US'; u.rate=0.98; u.pitch=1; u.volume=1;
+    var v=EN_VOICE || pickEnVoice();
+    if(v){
+      EN_VOICE=v;
+      u.voice=v;
+      /* 兜底语音若不是 en-US（极少见），让 lang 与语音保持一致，避免引擎忽略 voice */
+      if(!/^en[-_]us/i.test(String(v.lang||''))) u.lang=v.lang||'en-US';
+    }
     var done=false;
     var fin=function(){ if(done) return; done=true; if(cb) setTimeout(cb,150); };
     u.onend=fin; u.onerror=fin;
     setTimeout(fin, 5000);
-    speechSynthesis.cancel(); speechSynthesis.speak(u);
+    try{ speechSynthesis.cancel(); }catch(e){}
+    /* cancel 后立刻 speak 在部分浏览器会被吞掉，短延迟更稳 */
+    setTimeout(function(){ try{ speechSynthesis.speak(u); }catch(e){ fin(); } }, 30);
   }catch(e){ if(cb) setTimeout(cb,0); }
 }
 function playErrorBeep(){
